@@ -1,4 +1,3 @@
-
 # Dependencies
 node_modules/
 
@@ -7,13 +6,19 @@ node_modules/
 out/
 
 # TypeScript
-next-env.d.ts
 *.tsbuildinfo
+next-env.d.ts
 
 # Environment secrets
 .env
 .env.*
 !.env.example
+
+# Testing and coverage
+coverage/
+
+# Local tooling
+.vercel/
 
 # macOS
 .DS_Store

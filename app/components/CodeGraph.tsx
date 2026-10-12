@@ -29,6 +29,7 @@ import {
 } from "d3-force";
 import "@xyflow/react/dist/style.css";
 import { LANGUAGES } from "@/src/types/graph";
+import type { ImpactHighlight } from "@/src/analysis/impact";
 import type {
   AnalysisResult,
   Confidence,
@@ -60,6 +61,9 @@ const GROUP_LABEL: Record<Group, string> = {
 const EDGE_KINDS: readonly EdgeKind[] = ["contains", "imports", "calls"];
 const EDGE_LABEL: Record<EdgeKind, string> = { contains: "Contains", imports: "Imports", calls: "Calls" };
 const EDGE_COLOR: Record<EdgeKind, string> = { contains: "#6e7681", imports: "#58a6ff", calls: "#f0883e" };
+
+// Impact evidence colours (also used by .impact-* classes in globals.css).
+const IMPACT_COLOR = { syntax: "#2ea043", inferred: "#d29922" } as const;
 
 const LANGUAGE_LABEL: Record<Language, string> = {
   javascript: "JavaScript",
@@ -243,12 +247,26 @@ interface View {
   hiddenByCap: number;
 }
 
-function computeView(result: AnalysisResult, filters: Filters): View {
+/**
+ * With `impactIds` set, only those nodes are shown (filters are bypassed) so the
+ * affected area is visible regardless of the current group/language filters.
+ */
+function computeView(
+  result: AnalysisResult,
+  filters: Filters,
+  impactIds: ReadonlySet<string> | null,
+  pinnedId: string | null,
+): View {
   const nodesById = new Map(result.graph.nodes.map((node) => [node.id, node] as const));
-  const candidates = result.graph.nodes.filter((node) => passesFilters(node, filters));
+  const candidates = impactIds
+    ? result.graph.nodes.filter((node) => impactIds.has(node.id))
+    : result.graph.nodes.filter((node) => passesFilters(node, filters));
+  const enabled: Record<EdgeKind, boolean> = impactIds
+    ? { contains: true, imports: true, calls: true }
+    : filters.edges;
 
   let visible: Set<string> = new Set(candidates.map((node) => node.id));
-  let edges = buildViewEdges(result.graph.edges, nodesById, visible, filters.edges);
+  let edges = buildViewEdges(result.graph.edges, nodesById, visible, enabled);
   let hiddenByCap = 0;
 
   if (candidates.length > MAX_RENDER_NODES) {
@@ -257,12 +275,13 @@ function computeView(result: AnalysisResult, filters: Filters): View {
       degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
       degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
     }
+    if (pinnedId) degree.set(pinnedId, Number.MAX_SAFE_INTEGER); // never drop the impact target
     const ranked = [...candidates]
       .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0) || a.name.localeCompare(b.name))
       .slice(0, MAX_RENDER_NODES);
     visible = new Set(ranked.map((node) => node.id));
     hiddenByCap = candidates.length - visible.size;
-    edges = buildViewEdges(result.graph.edges, nodesById, visible, filters.edges);
+    edges = buildViewEdges(result.graph.edges, nodesById, visible, enabled);
   }
 
   return { nodes: candidates.filter((node) => visible.has(node.id)), edges, hiddenByCap };
@@ -371,6 +390,15 @@ function signatureOf(nodes: readonly GraphNode[], edges: readonly ViewEdge[]): s
 /* --------------------------------- nodes -------------------------------- */
 
 type Role = "selected" | "neighbor" | "dimmed" | "normal";
+type ImpactRole = "target" | "syntax" | "inferred" | "via" | "none";
+
+const IMPACT_FLAG: Record<ImpactRole, string | null> = {
+  target: "TARGET",
+  syntax: "SYNTAX",
+  inferred: "INFERRED",
+  via: "VIA",
+  none: null,
+};
 
 type CartoNodeData = {
   label: string;
@@ -378,20 +406,26 @@ type CartoNodeData = {
   kind: NodeKind;
   title: string;
   role: Role;
+  impact: ImpactRole | null;
 };
 type CartoNode = Node<CartoNodeData, "carto">;
 
 function CartoNodeView({ data }: NodeProps<CartoNode>) {
   // Below this zoom the second line is unreadable, so it is dropped to reduce clutter.
   const zoomedOut = useStore((state) => state.transform[2] < 0.5);
+  const flag = data.impact ? IMPACT_FLAG[data.impact] : null;
   return (
-    <div className={`carto-node kind-${data.kind} is-${data.role}`} title={data.title}>
+    <div
+      className={`carto-node kind-${data.kind} is-${data.role}${data.impact ? ` impact-${data.impact}` : ""}`}
+      title={data.title}
+    >
       <Handle type="target" position={Position.Top} className="carto-handle" isConnectable={false} />
       <span className="carto-node__badge">{KIND_BADGE[data.kind]}</span>
       <span className="carto-node__text">
         <span className="carto-node__label">{data.label}</span>
         {!zoomedOut && data.sublabel && <span className="carto-node__sub">{data.sublabel}</span>}
       </span>
+      {flag && <span className="carto-node__flag">{flag}</span>}
       <Handle type="source" position={Position.Bottom} className="carto-handle" isConnectable={false} />
     </div>
   );
@@ -416,6 +450,13 @@ function nodeTitle(node: GraphNode): string {
   return `${node.name} (${node.kind}) — ${where}`;
 }
 
+function impactRoleOf(nodeId: string, impact: ImpactHighlight): ImpactRole {
+  if (nodeId === impact.targetId) return "target";
+  const evidence = impact.evidenceById.get(nodeId);
+  if (evidence) return evidence;
+  return impact.extraIds.has(nodeId) ? "via" : "none";
+}
+
 /* -------------------------------- component ------------------------------- */
 
 interface CodeGraphProps {
@@ -425,8 +466,11 @@ interface CodeGraphProps {
   focusToken: number;
   /** Filter request from the overview panel; applied once per nonce. */
   command: GraphCommand | null;
+  /** Active change-impact result to highlight, or null. */
+  impact: ImpactHighlight | null;
   onSelect: (id: string) => void;
   onClear: () => void;
+  onClearImpact: () => void;
 }
 
 function FilterChip(props: { pressed: boolean; onClick: () => void; dot?: string; count?: number; children: string }) {
@@ -439,9 +483,15 @@ function FilterChip(props: { pressed: boolean; onClick: () => void; dot?: string
   );
 }
 
-function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClear }: CodeGraphProps) {
+function GraphCanvas({ result, selectedId, focusToken, command, impact, onSelect, onClear, onClearImpact }: CodeGraphProps) {
   const { fitView, setCenter, getZoom } = useReactFlow();
   const [filters, setFilters] = useState<Filters>(() => defaultFilters(result));
+  const [impactFocus, setImpactFocus] = useState(true);
+
+  const impactTargetId = impact?.targetId ?? null;
+  useEffect(() => {
+    setImpactFocus(true); // every new analysis starts focused on the affected area
+  }, [impactTargetId]);
 
   const nodesById = useMemo(
     () => new Map(result.graph.nodes.map((node) => [node.id, node] as const)),
@@ -457,7 +507,20 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
     [result],
   );
 
-  const view = useMemo(() => computeView(result, filters), [result, filters]);
+  // Target + affected nodes (what the report counts) and the wider set shown when focused.
+  const affectedIds = useMemo(
+    () => (impact ? [impact.targetId, ...impact.evidenceById.keys()] : []),
+    [impact],
+  );
+  const impactIds = useMemo(
+    () => (impact ? new Set<string>([...affectedIds, ...impact.extraIds]) : null),
+    [impact, affectedIds],
+  );
+
+  const view = useMemo(
+    () => computeView(result, filters, impactFocus ? impactIds : null, impactTargetId),
+    [result, filters, impactFocus, impactIds, impactTargetId],
+  );
   const layout = useMemo(() => layoutNodes(view.nodes, view.edges), [view]);
   const signature = useMemo(() => signatureOf(view.nodes, view.edges), [view]);
   const drawnIds = useMemo(() => new Set(view.nodes.map((node) => node.id)), [view]);
@@ -467,44 +530,77 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
   );
 
   // Direct neighbours of the selection among the *drawn* edges (visual selection only).
+  // While an impact analysis is active the impact highlighting takes over instead.
   const neighborIds = useMemo(() => {
     const ids = new Set<string>();
-    if (!selectedId) return ids;
+    if (!selectedId || impact) return ids;
     for (const edge of view.edges) {
       if (edge.source === selectedId) ids.add(edge.target);
       else if (edge.target === selectedId) ids.add(edge.source);
     }
     return ids;
-  }, [view.edges, selectedId]);
+  }, [view.edges, selectedId, impact]);
 
   const rfNodes = useMemo<CartoNode[]>(
     () =>
       layout.map(({ node, x, y }) => {
-        const role: Role =
-          selectedId === null
-            ? "normal"
-            : node.id === selectedId
-              ? "selected"
-              : neighborIds.has(node.id)
-                ? "neighbor"
-                : "dimmed";
+        let role: Role = "normal";
+        if (selectedId !== null) {
+          if (node.id === selectedId) role = "selected";
+          else if (!impact) role = neighborIds.has(node.id) ? "neighbor" : "dimmed";
+        }
         return {
           id: node.id,
           type: "carto",
           position: { x: x - NODE_WIDTH / 2, y: y - NODE_HEIGHT / 2 },
-          data: { label: node.name, sublabel: sublabelOf(node), kind: node.kind, title: nodeTitle(node), role },
+          data: {
+            label: node.name,
+            sublabel: sublabelOf(node),
+            kind: node.kind,
+            title: nodeTitle(node),
+            role,
+            impact: impact ? impactRoleOf(node.id, impact) : null,
+          },
           selected: role === "selected",
         };
       }),
-    [layout, selectedId, neighborIds],
+    [layout, selectedId, neighborIds, impact],
   );
 
   const rfEdges = useMemo<Edge[]>(
     () =>
       view.edges.map((edge) => {
         const color = EDGE_COLOR[edge.kind];
-        const isActive = selectedId !== null && (edge.source === selectedId || edge.target === selectedId);
         const baseOpacity = edge.kind === "contains" ? 0.45 : CONFIDENCE_OPACITY[edge.confidence];
+
+        if (impact) {
+          const evidence =
+            impact.hopPairs.get(`${edge.source}|${edge.target}`) ??
+            impact.hopPairs.get(`${edge.target}|${edge.source}`);
+          const stroke = evidence ? IMPACT_COLOR[evidence] : color;
+          return {
+            id: edge.id,
+            source: edge.source,
+            target: edge.target,
+            type: "straight",
+            label: edge.count > 1 ? `×${edge.count}` : undefined,
+            labelStyle: { fill: "#e6edf3", fontSize: 11 },
+            labelBgStyle: { fill: "#161b22" },
+            zIndex: evidence ? 10 : 0,
+            markerEnd:
+              edge.kind === "contains"
+                ? undefined
+                : { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
+            style: {
+              stroke,
+              strokeWidth: evidence ? 3 : 1,
+              strokeDasharray: (evidence ?? edge.basis) === "inferred" ? "6 4" : undefined,
+              opacity: evidence ? 1 : 0.18,
+            },
+          };
+        }
+
+        const isActive = selectedId !== null && (edge.source === selectedId || edge.target === selectedId);
         const opacity = selectedId === null ? baseOpacity : isActive ? 1 : 0.1;
         return {
           id: edge.id,
@@ -527,7 +623,7 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
           },
         };
       }),
-    [view.edges, selectedId],
+    [view.edges, selectedId, impact],
   );
 
   // Apply a filter request coming from the overview panel (once per nonce).
@@ -573,7 +669,7 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
         return;
       }
       const node = nodesById.get(selectedId);
-      if (node && !passesFilters(node, filters)) return; // filters are about to be relaxed
+      if (node && !impactFocus && !passesFilters(node, filters)) return; // filters are about to be relaxed
       handledFocus.current = focusToken; // cannot be drawn (node cap); fall through to fit
     }
 
@@ -581,7 +677,7 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
       lastFitSignature.current = signature;
       void fitView({ padding: 0.15, duration: 250 });
     }
-  }, [layout, signature, focusToken, selectedId, filters, nodesById, setCenter, getZoom, fitView]);
+  }, [layout, signature, focusToken, selectedId, filters, impactFocus, nodesById, setCenter, getZoom, fitView]);
 
   const handleNodeClick = useCallback<NodeMouseHandler<CartoNode>>(
     (_event, node) => onSelect(node.id),
@@ -612,6 +708,7 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
 
   const selectedNotDrawn = selectedId !== null && nodesById.has(selectedId) && !drawnIds.has(selectedId);
   const symbolsHidden = !filters.groups.functions && !filters.groups.types;
+  const affectedNotDrawn = impact ? affectedIds.filter((id) => !drawnIds.has(id)).length : 0;
 
   return (
     <div className="graph-card">
@@ -657,7 +754,20 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
             ))}
           </div>
         )}
+        {impact && (
+          <div className="filter-group">
+            <span className="filter-group__label">Impact</span>
+            <FilterChip pressed={impactFocus} onClick={() => setImpactFocus((value) => !value)}>
+              Focus on affected
+            </FilterChip>
+          </div>
+        )}
         <div className="filters__actions">
+          {impact && (
+            <button type="button" className="btn btn--ghost" onClick={onClearImpact}>
+              Clear impact
+            </button>
+          )}
           <button
             type="button"
             className="btn btn--ghost"
@@ -679,17 +789,23 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
 
       {view.hiddenByCap > 0 && (
         <div className="notice">
-          Showing the {MAX_RENDER_NODES} most-connected of {MAX_RENDER_NODES + view.hiddenByCap} matching nodes. Turn
-          off a group or language to see the rest.
+          Showing the {MAX_RENDER_NODES} most-connected of {MAX_RENDER_NODES + view.hiddenByCap} matching nodes.
+          {impact ? " Not every affected node is drawn; the report lists all of them." : " Turn off a group or language to see the rest."}
         </div>
       )}
-      {selectedNotDrawn && (
+      {impact && !impactFocus && affectedNotDrawn > 0 && (
+        <div className="notice">
+          {affectedNotDrawn} affected node{affectedNotDrawn === 1 ? " is" : "s are"} hidden by filters or the node limit.
+          Turn on “Focus on affected” to see them.
+        </div>
+      )}
+      {selectedNotDrawn && !impact && (
         <div className="notice">
           The selected node is not drawn (hidden by a filter or beyond the {MAX_RENDER_NODES}-node limit). Its details
           are still shown in the side panel.
         </div>
       )}
-      {symbolsHidden && filters.edges.calls && (
+      {symbolsHidden && filters.edges.calls && !impact && (
         <div className="notice notice--info">
           Symbols are hidden, so call edges connect whole files. ×N is the number of call edges merged into one.
         </div>
@@ -720,16 +836,7 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
         >
           <Background gap={24} />
           <Controls showInteractive={false} />
-          {layout.length > MINIMAP_MIN_NODES && (
-            <MiniMap
-              pannable
-              zoomable
-              nodeStrokeWidth={0}
-              nodeColor={(node) => colorById.get(node.id) ?? "#8b949e"}
-              maskColor="rgba(13, 17, 23, 0.72)"
-              ariaLabel="Graph minimap"
-            />
-          )}
+          
         </ReactFlow>
       </div>
 
@@ -753,6 +860,19 @@ function GraphCanvas({ result, selectedId, focusToken, command, onSelect, onClea
           <span className="legend__line legend__line--dashed" /> dashed = inferred
         </span>
         <span className="legend__item">fainter = lower confidence</span>
+        {impact && (
+          <>
+            <span className="legend__item">
+              <span className="legend__swatch impact-sw-target" /> TARGET
+            </span>
+            <span className="legend__item">
+              <span className="legend__swatch impact-sw-syntax" /> affected · SYNTAX chain
+            </span>
+            <span className="legend__item">
+              <span className="legend__swatch impact-sw-inferred" /> affected · INFERRED chain
+            </span>
+          </>
+        )}
       </div>
     </div>
   );
