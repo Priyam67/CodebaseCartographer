@@ -1,8 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import CodeGraph from "./components/CodeGraph";
+import CodeGraph, { type GraphCommand, type GraphCommandRequest } from "./components/CodeGraph";
 import DetailPanel, { buildGraphIndex } from "./components/DetailPanel";
+import OverviewPanel from "./components/OverviewPanel";
 import RepoInput, { type AnalyzeTarget } from "./components/RepoInput";
 import SearchBar from "./components/SearchBar";
 import { LANGUAGES } from "@/src/types/graph";
@@ -13,6 +14,8 @@ type Status =
   | { kind: "loading"; target: string }
   | { kind: "error"; code: string; message: string }
   | { kind: "success"; result: AnalysisResult; runId: number };
+
+type PanelTab = "overview" | "details";
 
 const LANGUAGE_LABEL: Record<Language, string> = {
   javascript: "JavaScript",
@@ -150,8 +153,11 @@ export default function Page() {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusToken, setFocusToken] = useState(0);
+  const [panelTab, setPanelTab] = useState<PanelTab>("overview");
+  const [graphCommand, setGraphCommand] = useState<GraphCommand | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const runCounter = useRef(0);
+  const commandCounter = useRef(0);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -161,6 +167,8 @@ export default function Page() {
     abortRef.current = controller;
 
     setSelectedId(null);
+    setGraphCommand(null);
+    setPanelTab("overview");
     setStatus({ kind: "loading", target: target.kind === "github" ? target.repoUrl : target.localPath });
 
     const body: AnalyzeRequest =
@@ -212,7 +220,18 @@ export default function Page() {
 
   const select = useCallback((id: string, focus: boolean): void => {
     setSelectedId(id);
+    setPanelTab("details");
     if (focus) setFocusToken((token) => token + 1);
+  }, []);
+
+  const clearSelection = useCallback((): void => {
+    setSelectedId(null);
+    setPanelTab("overview");
+  }, []);
+
+  const sendGraphCommand = useCallback((request: GraphCommandRequest): void => {
+    commandCounter.current += 1;
+    setGraphCommand({ ...request, nonce: commandCounter.current });
   }, []);
 
   return (
@@ -275,17 +294,55 @@ export default function Page() {
                   result={result}
                   selectedId={selectedId}
                   focusToken={focusToken}
+                  command={graphCommand}
                   onSelect={(id) => select(id, false)}
+                  onClear={clearSelection}
                 />
               </div>
-              <aside className="detail-col" aria-label="Node details">
-                <DetailPanel
-                  node={selectedNode}
-                  index={index}
-                  repo={result.repo}
-                  onSelect={(id) => select(id, true)}
-                  onClose={() => setSelectedId(null)}
-                />
+              <aside className="side-col" aria-label="Repository overview and node details">
+                <div className="panel-tabs" role="tablist" aria-label="Side panel">
+                  <button
+                    type="button"
+                    role="tab"
+                    id="tab-overview"
+                    aria-selected={panelTab === "overview"}
+                    aria-controls="panel-overview"
+                    className="tab-btn"
+                    onClick={() => setPanelTab("overview")}
+                  >
+                    Overview
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="tab-details"
+                    aria-selected={panelTab === "details"}
+                    aria-controls="panel-details"
+                    className="tab-btn"
+                    onClick={() => setPanelTab("details")}
+                  >
+                    Details
+                  </button>
+                </div>
+                {panelTab === "overview" ? (
+                  <div role="tabpanel" id="panel-overview" aria-labelledby="tab-overview">
+                    <OverviewPanel
+                      result={result}
+                      onSelectNode={(id) => select(id, true)}
+                      onGraphCommand={sendGraphCommand}
+                    />
+                  </div>
+                ) : (
+                  <div role="tabpanel" id="panel-details" aria-labelledby="tab-details">
+                    <DetailPanel
+                      node={selectedNode}
+                      index={index}
+                      repo={result.repo}
+                      onSelect={(id) => select(id, true)}
+                      onClose={clearSelection}
+                    />
+                  </div>
+                )}
               </aside>
             </div>
             <Diagnostics result={result} />
